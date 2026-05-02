@@ -1,0 +1,315 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Agentic RAG Workshop — Infrastructure for Bedrock KB + OpenSearch Serverless + Neptune Analytics.
+  Deploys all resources needed for the hands-on workshop.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: agentic-rag-workshop
+    Description: Name prefix for all resources
+
+Resources:
+
+  # ============================================================
+  # S3 Bucket for documents
+  # ============================================================
+  DocumentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-documents-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================
+  # OpenSearch Serverless Collection for vector store
+  # ============================================================
+  OpenSearchEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-enc'
+      Type: encryption
+      Policy: !Sub >
+        {
+          "Rules": [{"ResourceType": "collection", "Resource": ["collection/${ProjectName}"]}],
+          "AWSOwnedKey": true
+        }
+
+  OpenSearchNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-net'
+      Type: network
+      Policy: !Sub >
+        [{
+          "Rules": [
+            {"ResourceType": "collection", "Resource": ["collection/${ProjectName}"]},
+            {"ResourceType": "dashboard", "Resource": ["collection/${ProjectName}"]}
+          ],
+          "AllowFromPublic": true
+        }]
+
+  OpenSearchDataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-access'
+      Type: data
+      Policy: !Sub >
+        [{
+          "Rules": [
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/${ProjectName}"],
+              "Permission": ["aoss:CreateCollectionItems", "aoss:UpdateCollectionItems", "aoss:DescribeCollectionItems"]
+            },
+            {
+              "ResourceType": "index",
+              "Resource": ["index/${ProjectName}/*"],
+              "Permission": ["aoss:CreateIndex", "aoss:UpdateIndex", "aoss:DescribeIndex", "aoss:ReadDocument", "aoss:WriteDocument"]
+            }
+          ],
+          "Principal": [
+            "${KnowledgeBaseRole.Arn}",
+            "${LambdaRole.Arn}"
+          ]
+        }]
+
+  OpenSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn:
+      - OpenSearchEncryptionPolicy
+      - OpenSearchNetworkPolicy
+      - OpenSearchDataAccessPolicy
+    Properties:
+      Name: !Ref ProjectName
+      Type: VECTORSEARCH
+      Description: Vector store for Bedrock Knowledge Base
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================
+  # IAM Role for Bedrock Knowledge Base
+  # ============================================================
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-kb-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KnowledgeBasePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DocumentBucket.Arn
+                  - !Sub '${DocumentBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0'
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource:
+                  - !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:workshop-custom-chunker'
+
+  # ============================================================
+  # IAM Role for Lambda functions
+  # ============================================================
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaWorkshopPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DocumentBucket.Arn
+                  - !Sub '${DocumentBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - bedrock-agent:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource:
+                  - !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+              - Effect: Allow
+                Action:
+                  - neptune-graph:*
+                Resource: '*'
+
+  # ============================================================
+  # OpenSearch Serverless Index (created via custom resource)
+  # ============================================================
+  CreateIndexFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-create-index'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          COLLECTION_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
+          INDEX_NAME: workshop-kb-index
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib3
+          import boto3
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+          from botocore.credentials import Credentials
+
+          def handler(event, context):
+              if event.get('RequestType') == 'Delete':
+                  send_response(event, context, 'SUCCESS')
+                  return
+
+              endpoint = os.environ['COLLECTION_ENDPOINT']
+              index_name = os.environ['INDEX_NAME']
+              url = f'https://{endpoint}/{index_name}'
+
+              body = json.dumps({
+                  "settings": {
+                      "index.knn": True,
+                      "number_of_shards": 2,
+                      "number_of_replicas": 0
+                  },
+                  "mappings": {
+                      "properties": {
+                          "embedding": {
+                              "type": "knn_vector",
+                              "dimension": 1024,
+                              "method": {
+                                  "engine": "faiss",
+                                  "name": "hnsw",
+                                  "space_type": "l2"
+                              }
+                          },
+                          "text": {"type": "text"},
+                          "metadata": {"type": "text"}
+                      }
+                  }
+              })
+
+              session = boto3.Session()
+              credentials = session.get_credentials().get_frozen_credentials()
+              request = AWSRequest(method='PUT', url=url, data=body,
+                                   headers={'Content-Type': 'application/json'})
+              SigV4Auth(credentials, 'aoss', session.region_name).add_auth(request)
+
+              http = urllib3.PoolManager()
+              response = http.request(
+                  'PUT', url,
+                  body=body,
+                  headers=dict(request.headers)
+              )
+              print(f'Index creation response: {response.status} {response.data.decode()}')
+              send_response(event, context, 'SUCCESS')
+
+          def send_response(event, context, status):
+              import urllib3
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': f'See CloudWatch Log Stream: {context.log_stream_name}',
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+              })
+              http = urllib3.PoolManager()
+              http.request('PUT', event['ResponseURL'], body=body,
+                           headers={'Content-Type': '', 'Content-Length': str(len(body))})
+
+  CreateIndexCustomResource:
+    Type: Custom::CreateIndex
+    DependsOn: OpenSearchCollection
+    Properties:
+      ServiceToken: !GetAtt CreateIndexFunction.Arn
+
+Outputs:
+  WorkshopBucket:
+    Description: S3 bucket for workshop documents
+    Value: !Ref DocumentBucket
+    Export:
+      Name: !Sub '${ProjectName}-bucket'
+
+  OpenSearchCollectionArn:
+    Description: OpenSearch Serverless collection ARN
+    Value: !GetAtt OpenSearchCollection.Arn
+    Export:
+      Name: !Sub '${ProjectName}-collection-arn'
+
+  OpenSearchCollectionEndpoint:
+    Description: OpenSearch Serverless collection endpoint
+    Value: !GetAtt OpenSearchCollection.CollectionEndpoint
+    Export:
+      Name: !Sub '${ProjectName}-collection-endpoint'
+
+  KnowledgeBaseRoleArn:
+    Description: IAM role ARN for Bedrock Knowledge Base
+    Value: !GetAtt KnowledgeBaseRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-kb-role-arn'
+
+  LambdaRoleArn:
+    Description: IAM role ARN for Lambda functions
+    Value: !GetAtt LambdaRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-lambda-role-arn'
