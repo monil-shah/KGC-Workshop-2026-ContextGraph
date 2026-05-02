@@ -1,4 +1,4 @@
-# Building Agentic RAG on AWS
+# Building Agentic RAG with Context Graph on AWS
 
 > Hands-on workshop — 90 minutes
 >
